@@ -292,7 +292,17 @@ class MinTokensLogitsProcessor(LogitsProcessor):
 
 
 class ThinkingTokenBudgetLogitsProcessor(LogitsProcessor):
-    """Limits the number of tokens allowed inside a 'thinking' section."""
+    """Limits the number of tokens allowed inside a 'thinking' section.
+
+    Includes a soft budget zone in the last 20% of the budget where
+    the logit bias for the end token is progressively ramped, encouraging
+    the model to find a natural stopping point before the hard force.
+    """
+
+    # Fraction of budget where soft bias zone begins (80% = last 20%)
+    _SOFT_ZONE_START_FRAC = 0.8
+    # Maximum logit bias applied at the end of the soft zone
+    _SOFT_ZONE_MAX_BIAS = 8.0
 
     def __init__(
         self, vllm_config: "VllmConfig", device: torch.device, is_pin_memory: bool
@@ -373,6 +383,8 @@ class ThinkingTokenBudgetLogitsProcessor(LogitsProcessor):
         return {
             "in_think": in_think,  # Currently in thinking mode
             "in_end": in_think and thinking_token_budget == 0,
+            "in_soft": False,  # Currently in soft bias zone
+            "soft_bias": 0.0,  # Current logit bias for </think>
             "check_count_down": thinking_token_budget,
             "think_count": think_count,  # Number of tokens in thinking section
             "end_count": 0,  # Number of end tokens forced so far
@@ -448,24 +460,40 @@ class ThinkingTokenBudgetLogitsProcessor(LogitsProcessor):
                 # Continue thinking mode, increment count by new tokens
                 state["think_count"] += len(new_tokens)
 
-            # Set countdown based on current state
-            if state["in_think"]:
-                remaining_budget = max(
-                    0, state["thinking_token_budget"] - state["think_count"]
-                )
-                state["check_count_down"] = max(0, remaining_budget - 1)
-            else:
-                state["check_count_down"] = state["thinking_token_budget"]
+            # Soft budget: progressively boost </think> probability as
+            # the budget approaches, then hard force as safety net.
+            # Ref: NVIDIA NIM BudgetControlLogitsProcessor grace window
+            budget = state["thinking_token_budget"]
+            count = state["think_count"]
+            soft_start = int(budget * self._SOFT_ZONE_START_FRAC)
 
-            # Check if need to transition to end mode
-            if (
-                state["in_think"]
-                and state["think_count"] >= state["thinking_token_budget"]
-            ):
+            if state["in_think"] and count >= budget:
+                # Hard force -- safety net after soft zone
                 state["in_think"] = False
                 state["in_end"] = True
+                state["in_soft"] = False
+                state["soft_bias"] = 0.0
                 state["end_count"] = 0
-                state["check_count_down"] = state["thinking_token_budget"]
+                state["check_count_down"] = budget
+            elif state["in_think"] and count >= soft_start and budget > 0:
+                # Soft zone: ramp bias from 0 to max over last 20%
+                progress = (count - soft_start) / max(1, budget - soft_start)
+                state["in_soft"] = True
+                state["soft_bias"] = progress * self._SOFT_ZONE_MAX_BIAS
+                # Must check every token during soft zone
+                state["check_count_down"] = 0
+            elif state["in_think"]:
+                # Before soft zone: countdown to soft zone start
+                remaining_to_soft = max(
+                    0, soft_start - count
+                )
+                state["check_count_down"] = max(0, remaining_to_soft - 1)
+                state["in_soft"] = False
+                state["soft_bias"] = 0.0
+            else:
+                state["check_count_down"] = budget
+                state["in_soft"] = False
+                state["soft_bias"] = 0.0
         else:
             # In end mode
             state["end_count"] += 1
@@ -528,9 +556,15 @@ class ThinkingTokenBudgetLogitsProcessor(LogitsProcessor):
 
         for i in range(batch_size):
             state = self._state.get(i)
-            if state and state["in_end"]:
+            if not state:
+                continue
+            if state["in_end"]:
                 self.mask[i] = True
                 self.force_token_ids[i] = self.think_end_token_ids[state["end_count"]]
+            elif state.get("in_soft") and state["soft_bias"] > 0:
+                # Soft bias: boost </think> probability without forcing
+                for token_id in self.think_end_token_ids:
+                    logits[i, token_id] += state["soft_bias"]
 
         # Check in CPU first not to sync with GPU
         has_active_thinking = any(
