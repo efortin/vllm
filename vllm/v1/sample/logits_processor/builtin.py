@@ -605,34 +605,27 @@ class ThinkingTokenBudgetLogitsProcessor(LogitsProcessor):
                 self.mask[i] = True
                 self.force_token_ids[i] = self.think_end_token_ids[state["end_count"]]
             elif state.get("in_think") and state.get("in_soft") and state["soft_bias"] > 0:
-                # Use the same mask+force mechanism as hard force, but
-                # with a progress-dependent value. This ensures the GPU
-                # tensor is modified via the same vectorized path that
-                # is known to work for hard force.
+                # Soft bias via GPU tensor op
+                top_logit = logits[i].max().item()
                 progress = state["soft_bias"] / self._SOFT_ZONE_MAX_BIAS
-                if progress >= 0.5:
-                    # Above 50% progress: force </think> via mask
-                    self.mask[i] = True
-                    self.force_token_ids[i] = self.think_end_token_ids[0]
-                    import logging
-                    logging.getLogger("vllm.soft_budget").warning(
-                        "soft_budget APPLY: FORCE via mask at progress=%.0f%%",
-                        progress * 100)
-                else:
-                    # Below 50%: additive bias via GPU tensor op
-                    top_logit = logits[i].max().item()
-                    gap = 5.0 - 25.0 * progress
-                    target = top_logit - gap
-                    end_ids = torch.tensor(
-                        self.think_end_token_ids,
-                        device=self.device, dtype=torch.long)
-                    current = logits[i, end_ids]
-                    new_vals = torch.clamp(current, min=target)
-                    logits[i, end_ids] = new_vals
-                    import logging
-                    logging.getLogger("vllm.soft_budget").warning(
-                        "soft_budget APPLY: bias token=%d target=%.1f top=%.1f gap=%.1f progress=%.0f%%",
-                        self.think_end_token_ids[0], target, top_logit, gap, progress * 100)
+                gap = 5.0 - 25.0 * progress
+                target = top_logit - gap
+                end_ids = torch.tensor(
+                    self.think_end_token_ids,
+                    device=self.device, dtype=torch.long)
+                current = logits[i, end_ids]
+                new_vals = torch.clamp(current, min=target)
+                logits[i, end_ids] = new_vals
+                # Pre-arm suppression: if </think> gets sampled this step,
+                # the NEXT step's apply() will already suppress the echo.
+                # Without this, there's a 1-step delay (detection in
+                # update_state -> suppression in apply), allowing one echo.
+                if gap < 0:
+                    state["suppress_end_count"] = 5
+                import logging
+                logging.getLogger("vllm.soft_budget").warning(
+                    "soft_budget APPLY: bias token=%d target=%.1f top=%.1f gap=%.1f progress=%.0f%%",
+                    self.think_end_token_ids[0], target, top_logit, gap, progress * 100)
 
         # Apply force via mask (used by both hard force and soft force >50%)
         current_mask = self.mask[:batch_size]
@@ -644,14 +637,20 @@ class ThinkingTokenBudgetLogitsProcessor(LogitsProcessor):
 
         # Suppress </think> echo after exiting think mode.
         # The model tends to repeat </think> after being forced/nudged out.
+        # Use mask+force mechanism to set logit to -1e9 (same GPU path).
+        end_ids = torch.tensor(
+            self.think_end_token_ids, device=self.device, dtype=torch.long)
         for i in range(batch_size):
             state = self._state.get(i)
             if not state:
                 continue
             suppress = state.get("suppress_end_count", 0)
-            if suppress > 0:
-                for token_id in self.think_end_token_ids:
-                    logits[i, token_id] = -float("inf")
+            if suppress > 0 and not state.get("in_soft"):
+                logits[i, end_ids] = -1e9
+                import logging
+                logging.getLogger("vllm.soft_budget").warning(
+                    "soft_budget SUPPRESS: i=%d suppress_remaining=%d",
+                    i, suppress - 1)
                 state["suppress_end_count"] = suppress - 1
 
         return logits
