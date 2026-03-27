@@ -300,9 +300,9 @@ class ThinkingTokenBudgetLogitsProcessor(LogitsProcessor):
     """
 
     # Fraction of budget where soft bias zone begins (80% = last 20%)
-    _SOFT_ZONE_START_FRAC = 0.8
+    _SOFT_ZONE_START_FRAC = 0.7
     # Maximum logit bias applied at the end of the soft zone
-    _SOFT_ZONE_MAX_BIAS = 8.0
+    _SOFT_ZONE_MAX_BIAS = 16.0
 
     def __init__(
         self, vllm_config: "VllmConfig", device: torch.device, is_pin_memory: bool
@@ -385,6 +385,7 @@ class ThinkingTokenBudgetLogitsProcessor(LogitsProcessor):
             "in_end": in_think and thinking_token_budget == 0,
             "in_soft": False,  # Currently in soft bias zone
             "soft_bias": 0.0,  # Current logit bias for </think>
+            "suppress_end_count": 0,  # Tokens remaining to suppress </think> echo
             "check_count_down": thinking_token_budget,
             "think_count": think_count,  # Number of tokens in thinking section
             "end_count": 0,  # Number of end tokens forced so far
@@ -396,8 +397,15 @@ class ThinkingTokenBudgetLogitsProcessor(LogitsProcessor):
         }
 
     def _update_think_state(self, state: dict[str, Any]):
-        """Updates the state based on newly generated output tokens."""
-        if not state.get("in_end", False) and state.get("check_count_down", 0) > 0:
+        """Updates the state based on newly generated output tokens.
+
+        Note: when thinking_token_budget is set, we skip the check_count_down
+        optimization to ensure the soft bias zone is applied token-by-token.
+        Without this, think_count jumps from 0 to >=budget in one step when
+        the countdown expires, completely skipping the soft zone.
+        """
+        has_budget = state.get("thinking_token_budget", 0) > 0
+        if not state.get("in_end", False) and state.get("check_count_down", 0) > 0 and not has_budget:
             state["check_count_down"] -= 1
             return
 
@@ -412,9 +420,29 @@ class ThinkingTokenBudgetLogitsProcessor(LogitsProcessor):
         if current_length <= prev_length:
             return
 
-        # Process only newly added tokens
-        new_tokens = output[prev_length:]
-        state["prev_output_length"] = current_length
+        # vLLM v1 pre-extends output_tok_ids with a -1 sentinel before
+        # sampling fills in the actual token. Strip trailing -1 to get
+        # only the tokens that have actually been sampled.
+        effective_length = current_length
+        while effective_length > prev_length and output[effective_length - 1] == -1:
+            effective_length -= 1
+
+        if effective_length <= prev_length:
+            # Only -1 sentinels added, no real tokens yet
+            return
+
+        # Process only newly added real tokens
+        new_tokens = output[prev_length:effective_length]
+        state["prev_output_length"] = effective_length
+
+        import logging
+        _log = logging.getLogger("vllm.soft_budget")
+        if state.get("thinking_token_budget", 0) > 0:
+            _log.warning(
+                "soft_budget STATE: len=%d eff=%d new=%s last5=%s in_think=%s",
+                current_length, effective_length, new_tokens[-3:],
+                output[max(0, effective_length-5):effective_length],
+                state.get("in_think"))
 
         # Check if new tokens contain think start or end sequences
         start_len = len(self.think_start_token_ids)
@@ -445,7 +473,10 @@ class ThinkingTokenBudgetLogitsProcessor(LogitsProcessor):
                 else:
                     # Case: ...<start>...<end>... - exiting think mode
                     state["in_think"] = False
+                    state["in_soft"] = False
+                    state["soft_bias"] = 0.0
                     state["think_count"] = 0
+                    state["suppress_end_count"] = 5
             elif recent_start_pos >= 0:
                 # Found think start - entering think mode
                 absolute_start_pos = check_start_idx + recent_start_pos
@@ -455,7 +486,10 @@ class ThinkingTokenBudgetLogitsProcessor(LogitsProcessor):
             elif recent_end_pos >= 0:
                 # Found think end - exiting think mode
                 state["in_think"] = False
+                state["in_soft"] = False
+                state["soft_bias"] = 0.0
                 state["think_count"] = 0
+                state["suppress_end_count"] = 5
             elif state["in_think"]:
                 # Continue thinking mode, increment count by new tokens
                 state["think_count"] += len(new_tokens)
@@ -469,6 +503,10 @@ class ThinkingTokenBudgetLogitsProcessor(LogitsProcessor):
 
             if state["in_think"] and count >= budget:
                 # Hard force -- safety net after soft zone
+                import logging
+                logging.getLogger("vllm.soft_budget").warning(
+                    "soft_budget: HARD FORCE at count=%d/%d (soft zone failed)",
+                    count, budget)
                 state["in_think"] = False
                 state["in_end"] = True
                 state["in_soft"] = False
@@ -480,6 +518,10 @@ class ThinkingTokenBudgetLogitsProcessor(LogitsProcessor):
                 progress = (count - soft_start) / max(1, budget - soft_start)
                 state["in_soft"] = True
                 state["soft_bias"] = progress * self._SOFT_ZONE_MAX_BIAS
+                import logging
+                logging.getLogger("vllm.soft_budget").warning(
+                    "soft_budget: count=%d/%d bias=%.1f progress=%.0f%%",
+                    count, budget, state["soft_bias"], progress * 100)
                 # Must check every token during soft zone
                 state["check_count_down"] = 0
             elif state["in_think"]:
@@ -503,6 +545,7 @@ class ThinkingTokenBudgetLogitsProcessor(LogitsProcessor):
                         "in_end": False,
                         "end_count": 0,
                         "check_count_down": state["thinking_token_budget"],
+                        "suppress_end_count": 5,
                     }
                 )
 
@@ -561,23 +604,55 @@ class ThinkingTokenBudgetLogitsProcessor(LogitsProcessor):
             if state["in_end"]:
                 self.mask[i] = True
                 self.force_token_ids[i] = self.think_end_token_ids[state["end_count"]]
-            elif state.get("in_soft") and state["soft_bias"] > 0:
-                # Soft bias: boost </think> probability without forcing
+            elif state.get("in_think") and state.get("in_soft") and state["soft_bias"] > 0:
+                # Use the same mask+force mechanism as hard force, but
+                # with a progress-dependent value. This ensures the GPU
+                # tensor is modified via the same vectorized path that
+                # is known to work for hard force.
+                progress = state["soft_bias"] / self._SOFT_ZONE_MAX_BIAS
+                if progress >= 0.5:
+                    # Above 50% progress: force </think> via mask
+                    self.mask[i] = True
+                    self.force_token_ids[i] = self.think_end_token_ids[0]
+                    import logging
+                    logging.getLogger("vllm.soft_budget").warning(
+                        "soft_budget APPLY: FORCE via mask at progress=%.0f%%",
+                        progress * 100)
+                else:
+                    # Below 50%: additive bias via GPU tensor op
+                    top_logit = logits[i].max().item()
+                    gap = 5.0 - 25.0 * progress
+                    target = top_logit - gap
+                    end_ids = torch.tensor(
+                        self.think_end_token_ids,
+                        device=self.device, dtype=torch.long)
+                    current = logits[i, end_ids]
+                    new_vals = torch.clamp(current, min=target)
+                    logits[i, end_ids] = new_vals
+                    import logging
+                    logging.getLogger("vllm.soft_budget").warning(
+                        "soft_budget APPLY: bias token=%d target=%.1f top=%.1f gap=%.1f progress=%.0f%%",
+                        self.think_end_token_ids[0], target, top_logit, gap, progress * 100)
+
+        # Apply force via mask (used by both hard force and soft force >50%)
+        current_mask = self.mask[:batch_size]
+        active_indices = current_mask.nonzero(as_tuple=False).view(-1)
+        if len(active_indices) > 0:
+            force_tokens = self.force_token_ids[active_indices]
+            # Apply a large value for the end thinking token id index
+            logits[active_indices, force_tokens] = 1e9
+
+        # Suppress </think> echo after exiting think mode.
+        # The model tends to repeat </think> after being forced/nudged out.
+        for i in range(batch_size):
+            state = self._state.get(i)
+            if not state:
+                continue
+            suppress = state.get("suppress_end_count", 0)
+            if suppress > 0:
                 for token_id in self.think_end_token_ids:
-                    logits[i, token_id] += state["soft_bias"]
-
-        # Check in CPU first not to sync with GPU
-        has_active_thinking = any(
-            state.get("in_end", False) for state in self._state.values()
-        )
-
-        if has_active_thinking:
-            current_mask = self.mask[:batch_size]
-            active_indices = current_mask.nonzero(as_tuple=False).view(-1)
-            if len(active_indices) > 0:
-                force_tokens = self.force_token_ids[active_indices]
-                # Apply a large value for the end thinking token id index
-                logits[active_indices, force_tokens] = 1e9
+                    logits[i, token_id] = -float("inf")
+                state["suppress_end_count"] = suppress - 1
 
         return logits
 
