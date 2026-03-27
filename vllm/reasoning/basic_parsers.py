@@ -115,14 +115,16 @@ class BaseThinkingReasoningParser(ReasoningParser):
                 # extract reasoning content
                 end_index = delta_text.find(self.end_token)
                 reasoning = delta_text[:end_index]
-                content = delta_text[end_index + len(self.end_token) :]
+                content = self.strip_end_token_echo(
+                    delta_text[end_index + len(self.end_token) :])
                 return DeltaMessage(
-                    reasoning=reasoning, content=content if content else None
+                    reasoning=reasoning, content=content
                 )
             elif self.end_token_id in previous_token_ids:
                 # start token in previous, end token in previous,
                 # reasoning content continues
-                return DeltaMessage(content=delta_text)
+                content = self.strip_end_token_echo(delta_text)
+                return DeltaMessage(content=content) if content else None
             else:
                 # start token in previous, no end token in previous or delta,
                 # reasoning content continues
@@ -134,9 +136,10 @@ class BaseThinkingReasoningParser(ReasoningParser):
                 start_index = delta_text.find(self.start_token)
                 end_index = delta_text.find(self.end_token)
                 reasoning = delta_text[start_index + len(self.start_token) : end_index]
-                content = delta_text[end_index + len(self.end_token) :]
+                content = self.strip_end_token_echo(
+                    delta_text[end_index + len(self.end_token) :])
                 return DeltaMessage(
-                    reasoning=reasoning, content=content if content else None
+                    reasoning=reasoning, content=content
                 )
             else:
                 # start token in delta, no end token in delta,
@@ -168,9 +171,22 @@ class BaseThinkingReasoningParser(ReasoningParser):
             return model_output, None
         else:
             reasoning, _, content = model_output.partition(self.end_token)
-            # If generation stops right after end-of-think, return null content
-            final_content = content or None
-            return reasoning, final_content
+            content = self.strip_end_token_echo(content)
+            return reasoning, content
+
+    def strip_end_token_echo(self, content: str | None) -> str | None:
+        """Strip echoed end tokens from the start of content.
+
+        When thinking_token_budget forces the end token, the model may
+        echo it due to async scheduling pipeline delay. This strips
+        those echoes from the content portion after extraction.
+        """
+        if not content:
+            return content
+        while content.startswith(self.end_token):
+            content = content[len(self.end_token):]
+        content = content.lstrip()
+        return content or None
 
     def count_reasoning_tokens(self, token_ids: Sequence[int]) -> int:
         """Count tokens that fall within start/end thinking markers.

@@ -88,9 +88,8 @@ class Qwen3ReasoningParser(BaseThinkingReasoningParser):
 
         # Extract reasoning content from the model output.
         reasoning, _, content = model_output.partition(self.end_token)
-
-        final_content = content or None
-        return reasoning, final_content
+        content = self.strip_end_token_echo(content)
+        return reasoning, content
 
     def extract_reasoning_streaming(
         self,
@@ -125,12 +124,13 @@ class Qwen3ReasoningParser(BaseThinkingReasoningParser):
             end_index = delta_text.find(self.end_token)
             if end_index >= 0:
                 reasoning = delta_text[:end_index]
-                content = delta_text[end_index + len(self.end_token) :]
+                content = self.strip_end_token_echo(
+                    delta_text[end_index + len(self.end_token) :])
                 if not reasoning and not content:
                     return None
                 return DeltaMessage(
                     reasoning=reasoning if reasoning else None,
-                    content=content if content else None,
+                    content=content,
                 )
             # end_token_id in IDs but not in text (already stripped)
             return None
@@ -141,7 +141,8 @@ class Qwen3ReasoningParser(BaseThinkingReasoningParser):
             return None
         elif self.end_token_id in previous_token_ids:
             # End token already passed: everything is content now.
-            return DeltaMessage(content=delta_text)
+            content = self.strip_end_token_echo(delta_text)
+            return DeltaMessage(content=content) if content else None
         else:
             # No end token yet: still in reasoning phase.
             return DeltaMessage(reasoning=delta_text)
